@@ -236,7 +236,7 @@ curl -X POST http://localhost:8000/api/migrate \
 | Relationship | RELATED, SELECTEDVALUE | Supported |
 | Text | CONCATENATE, CONTAINSSTRING | Supported |
 | Date | TODAY, EOMONTH, EDATE, DATEDIFF, DATEADD | Supported |
-| Time intelligence | TOTALYTD (window spec extraction) | Supported |
+| Time intelligence | TOTAL/DATES YTD, QTD, MTD (window spec extraction), incl. fiscal-year anchor e.g. `DATESYTD(dates, "30-06")` | Supported |
 | Variables | VAR / RETURN (multi-variable inlining) | Supported |
 | Iterators | SUMX, COUNTX, AVERAGEX | Supported |
 | Measure refs | [Measure Name] cross-referencing | Supported |

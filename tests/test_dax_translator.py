@@ -290,6 +290,67 @@ def test_totalytd_produces_compound_window_spec():
         assert "group_by" not in w
 
 
+def test_fiscal_year_anchor_resets_on_fiscal_year():
+    # DATESYTD(dates, "30-06") -> year ends 30 June, so the window resets 1 July.
+    result = translator().translate(
+        """CALCULATE([Base Measure], DATESYTD('Calendar'[Date], "30-06"),
+                     ALL('Calendar'))""",
+        "FactTable",
+    )
+    assert result.window_spec[0]["order"] == "date"
+    assert result.window_spec[1]["order"] == "date__fy7_year"
+    assert "YTD_fiscal_year_reset" in result.applied_transformations
+
+
+def test_fiscal_year_anchor_on_totalytd():
+    # US-style MM/DD literal, anchor as TOTALYTD's trailing argument.
+    result = translator().translate(
+        'TOTALYTD(SUM(FactTable[Value]), DimDate[FullDate], "9/30")',
+        "FactTable",
+    )
+    # The date column must come from the date argument, not the anchor.
+    assert result.window_spec[0]["order"] == "fulldate"
+    assert result.window_spec[1]["order"] == "fulldate__fy10_year"
+
+
+def test_calendar_year_anchor_keeps_calendar_reset():
+    result = translator().translate(
+        'CALCULATE([Base Measure], DATESYTD(\'Calendar\'[Date], "31-12"))',
+        "FactTable",
+    )
+    assert result.window_spec[1]["order"] == "date__year"
+    assert "YTD_fiscal_year_reset" not in result.applied_transformations
+
+
+def test_non_month_boundary_anchor_falls_back_with_warning():
+    result = translator().translate(
+        'CALCULATE([Base Measure], DATESYTD(\'Calendar\'[Date], "15-06"))',
+        "FactTable",
+    )
+    assert result.window_spec[1]["order"] == "date__year"
+    assert any("month boundary" in w for w in result.warnings)
+
+
+def test_ambiguous_anchor_falls_back_with_warning():
+    result = translator().translate(
+        'CALCULATE([Base Measure], DATESYTD(\'Calendar\'[Date], "11-12"))',
+        "FactTable",
+    )
+    assert result.window_spec[1]["order"] == "date__year"
+    assert any("ambiguous" in w for w in result.warnings)
+
+
+def test_filter_literal_is_not_mistaken_for_a_fiscal_anchor():
+    # Only a standalone string-literal argument is an anchor; a date-like
+    # literal inside a filter argument must not switch the reset to fiscal.
+    result = translator().translate(
+        """TOTALYTD(SUM(FactTable[Value]), 'Calendar'[Date],
+                    'Calendar'[Period] = "06-30")""",
+        "FactTable",
+    )
+    assert result.window_spec[1]["order"] == "date__year"
+
+
 def test_totalmtd_reset_grain_is_month():
     result = translator().translate(
         "TOTALMTD(SUM(FactSales[SalesAmount]), FactSales[OrderDate])",

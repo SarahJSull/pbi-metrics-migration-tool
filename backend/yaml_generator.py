@@ -88,6 +88,23 @@ def _sanitize_name(name: str) -> str:
     return s
 
 
+def _period_start_expr(src: str, grain: str,
+                       fy_start_month: Optional[str] = None) -> str:
+    """SQL for the start of the period containing *src*.
+
+    *grain* is MONTH / QUARTER / YEAR. When *fy_start_month* is given (2-12),
+    YEAR means the FISCAL year: the date is shifted back so the fiscal year
+    starts in January, truncated, then shifted forward again — yielding the
+    fiscal-year start date (e.g. 2024-07-01 for an Australian FY25 date).
+    """
+    if grain == "YEAR" and fy_start_month:
+        shift = (int(fy_start_month) - 1) % 12
+        if shift:
+            return (f"add_months(date_trunc('YEAR', add_months({src}, -{shift})), "
+                    f"{shift})")
+    return f"date_trunc('{grain}', {src})"
+
+
 # Power BI / TMDL data types -> Databricks SQL types. Used to emit CREATE TABLE
 # IF NOT EXISTS for the physical tables the generated metric views read from.
 # Unknown or missing types fall back to STRING (a safe, always-castable default).
@@ -561,9 +578,13 @@ class MetricViewYAMLGenerator:
                 # `<col>__<period>` order (see DAXTranslator._extract_window_spec).
                 # Materialize it as date_trunc('<PERIOD>', <col>) over the same
                 # base column the cumulative entry orders by (fact or joined).
-                reset = re.match(r'^(.*)__(month|quarter|year)$', str(order), re.I)
+                # A fiscal YTD arrives as `<col>__fy<start_month>_year` and is
+                # materialized as the fiscal-year start date instead.
+                reset = re.match(r'^(.*)__(?:fy(\d{1,2})_)?(month|quarter|year)$',
+                                 str(order), re.I)
                 if reset:
-                    base, grain = reset.group(1), reset.group(2).upper()
+                    base, fy_start, grain = (reset.group(1), reset.group(2),
+                                             reset.group(3).upper())
                     base_col = _sanitize_name(base)
                     fact_cols = known_columns.get(fact_table_lower) if known_columns else None
                     src = None
@@ -577,7 +598,7 @@ class MetricViewYAMLGenerator:
                             src = f"{alias}.{base_col}"
                     if src:
                         spec.dimensions.append(MetricViewDimension(
-                            name=order, expr=f"date_trunc('{grain}', {src})"))
+                            name=order, expr=_period_start_expr(src, grain, fy_start)))
                         dim_by_lower[str(order).lower()] = order
                         w["order"] = order
                         continue

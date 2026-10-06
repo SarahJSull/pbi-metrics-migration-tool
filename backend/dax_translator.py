@@ -424,6 +424,16 @@ class DAXTranslator:
     }
     _TI_PRIOR_YEAR = ("SAMEPERIODLASTYEAR", "PREVIOUSYEAR", "PARALLELPERIOD")
 
+    # A DAX year-end-date anchor makes a YTD fiscal rather than calendar, e.g.
+    # DATESYTD('Calendar'[Date], "30-06") or TOTALYTD(m, dates, "6/30"). The
+    # literal is locale-formatted (DD-MM here, MM/DD in the US), so both
+    # readings are considered — see _parse_year_end. A trailing year component,
+    # if present, carries no information and is ignored.
+    _RE_YEAR_END = re.compile(
+        r'"\s*(\d{1,2})\s*[-/]\s*(\d{1,2})\s*(?:[-/]\s*\d{2,4}\s*)?"')
+    # Last day of each month; February is 29 so a leap-year anchor still parses.
+    _DAYS_IN_MONTH = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
     def _extract_window_spec(self, dax_expr: str) -> Optional[dict]:
         """Extract a Metric View window spec from time-intelligence DAX.
 
@@ -443,22 +453,24 @@ class DAXTranslator:
         #
         # The reset entry orders by a synthetic `<date_col>__<period>` dimension;
         # the YAML generator materializes it as date_trunc('<PERIOD>', <date_col>).
+        # A fiscal YTD resets on the fiscal year instead, and is carried as
+        # `<date_col>__fy<start_month>_year` (the generator materializes it as a
+        # fiscal-year start date).
         # A prior-year offset (LY MTD/YTD), when built by the generator's offset
         # pushdown, is merged onto BOTH entries — shifting the reset anchor too,
         # which is required or the un-shifted `current` anchor nulls the result.
         for func, period in self._TI_CUMULATIVE.items():
             if re.search(rf'\b{func}\b', dax_expr, re.IGNORECASE):
                 date_col = self._find_date_column(dax_expr, func)
-                # A fiscal-year anchor (e.g. DATESYTD(dates, \"30-06\")) can't be
-                # expressed directly in the window — surface it for review.
-                if re.search(r'"\d{1,2}-\d{1,2}"', dax_expr):
-                    self._warnings.append(
-                        "Fiscal-year anchor detected; confirm the source table's "
-                        "date grain reflects the fiscal calendar"
-                    )
+                reset_order = f"{date_col}__{period}"
+                if period == "year":
+                    start_month = self._fiscal_start_month(dax_expr, func)
+                    if start_month:
+                        reset_order = f"{date_col}__fy{start_month}_year"
+                        self._transformations.append("YTD_fiscal_year_reset")
                 return [
                     {"order": date_col, "range": "cumulative", "semiadditive": "last"},
-                    {"order": f"{date_col}__{period}", "range": "current",
+                    {"order": reset_order, "range": "current",
                      "semiadditive": "last"},
                 ]
 
@@ -493,26 +505,111 @@ class DAXTranslator:
 
         return None
 
+    def _fiscal_start_month(self, dax_expr: str, func: str) -> Optional[int]:
+        """Fiscal-year start month from *func*'s year-end-date anchor.
+
+        ``DATESYTD(dates, "30-06")`` / ``TOTALYTD(m, dates, "6/30")`` mean the
+        year ends on 30 June, so the fiscal year starts in July -> 7. Returns
+        ``None`` when there is no anchor, when it is the calendar year end
+        (31 December), or when it cannot be mapped to a month boundary — in
+        each of those cases the calendar-year reset applies.
+        """
+        # The anchor is a standalone string-literal argument, and never the
+        # first one (a measure for TOTAL*TD, the date reference for DATES*TD).
+        # Requiring a whole argument keeps a filter argument that merely
+        # contains a similar literal (e.g. Calendar[Period] = "06-30") out.
+        args = self._func_args(dax_expr, func) or []
+        anchor = next(
+            (a for a in args[1:] if self._RE_YEAR_END.fullmatch(a.strip())), None)
+        if anchor is None:
+            return None
+
+        parsed = self._parse_year_end(anchor)
+        if parsed is None:
+            self._warnings.append(
+                f"Year-end-date anchor on {func} is ambiguous (cannot tell the "
+                "day from the month); the window resets on the calendar year"
+            )
+            return None
+
+        month, day = parsed
+        if month == 12 and day == 31:
+            return None  # calendar year — the default reset already matches
+        # A fiscal year that does not end on a month boundary cannot be
+        # expressed as a month-shifted year truncation.
+        month_end = 28 if month == 2 else self._DAYS_IN_MONTH[month - 1]
+        if day < month_end:
+            self._warnings.append(
+                f"Year-end-date anchor on {func} ({day:02d}-{month:02d}) is not a "
+                "month boundary and cannot be expressed as a window reset; the "
+                "window resets on the calendar year"
+            )
+            return None
+        return month % 12 + 1
+
+    @classmethod
+    def _parse_year_end(cls, text: str) -> Optional[Tuple[int, int]]:
+        """``(month, day)`` from a DAX year-end-date literal in *text*.
+
+        The literal's component order follows the model's locale, so it is
+        resolved by range first (a value above 12 can only be the day), then by
+        month boundary (fiscal years end on one). Returns ``None`` when neither
+        reading is decisive.
+        """
+        m = cls._RE_YEAR_END.search(text)
+        if not m:
+            return None
+        a, b = int(m.group(1)), int(m.group(2))
+        if 1 <= b <= 12 and a > 12:
+            month, day = b, a           # DD-MM
+        elif 1 <= a <= 12 and b > 12:
+            month, day = a, b           # MM-DD
+        elif 1 <= a <= 12 and b == cls._DAYS_IN_MONTH[a - 1]:
+            month, day = a, b
+        elif 1 <= b <= 12 and a == cls._DAYS_IN_MONTH[b - 1]:
+            month, day = b, a
+        else:
+            return None
+        if day > cls._DAYS_IN_MONTH[month - 1]:
+            return None
+        return month, day
+
+    @classmethod
+    def _func_args(cls, dax_expr: str, func: str) -> Optional[List[str]]:
+        """Top-level arguments of the first call to *func* in *dax_expr*.
+
+        ``None`` when *func* is absent or its argument list is unbalanced.
+        """
+        m = re.search(rf'\b{func}\s*\(', dax_expr, re.IGNORECASE)
+        if not m:
+            return None
+        open_idx = m.end() - 1
+        close_idx = cls._find_balanced_paren(dax_expr, open_idx)
+        if close_idx == -1:
+            return None
+        return cls._split_top_level_args(dax_expr[open_idx + 1:close_idx])
+
     @classmethod
     def _find_date_column(cls, dax_expr: str, func: str) -> str:
         """Best-effort extraction of the date column referenced by *func*.
 
-        The date column is the final argument of TOTAL*TD(measure, dates), so we
-        parse the balanced argument list and take the last Table[Column] ref.
+        The date reference sits at a known position — first for
+        DATES*TD(dates, ...) and the prior-period functions, second for
+        TOTAL*TD(measure, dates, ...) — so that argument is tried first, then
+        the remaining ones from the right (skipping a trailing year-end-date
+        anchor, which holds no column reference).
         """
-        m = re.search(rf'\b{func}\s*\(', dax_expr, re.IGNORECASE)
-        search_space = dax_expr
-        if m:
-            open_idx = m.end() - 1
-            close_idx = cls._find_balanced_paren(dax_expr, open_idx)
-            if close_idx != -1:
-                inner = dax_expr[open_idx + 1:close_idx]
-                args = cls._split_top_level_args(inner)
-                # Prefer the last argument (the date reference).
-                search_space = args[-1] if args else inner
-        col_m = list(RE_TABLE_COL.finditer(search_space))
-        if col_m:
-            return col_m[-1].group(2).lower().replace(" ", "_")
+        args = cls._func_args(dax_expr, func)
+        if args:
+            date_idx = 1 if func.upper().startswith("TOTAL") else 0
+            search_spaces = ([args[date_idx]] if date_idx < len(args) else []) + \
+                list(reversed(args))
+        else:
+            search_spaces = [dax_expr]
+        for space in search_spaces:
+            col_m = list(RE_TABLE_COL.finditer(space))
+            if col_m:
+                return col_m[-1].group(2).lower().replace(" ", "_")
         return "date"
 
     @staticmethod

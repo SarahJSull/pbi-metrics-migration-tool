@@ -439,6 +439,53 @@ def test_compound_reset_synthesizes_date_trunc_dimension():
     assert dims["orderdate__month"] == "date_trunc('MONTH', source.orderdate)"
 
 
+def _build_fiscal_ytd_spec(order="orderdate__fy7_year"):
+    return _gen().build_spec(
+        model_name="Sales",
+        fact_table="FactSales",
+        catalog="main", schema="gold",
+        tables=[{"name": "FactSales",
+                 "columns": [{"name": "OrderDate", "dataType": "dateTime"},
+                             {"name": "Amount", "dataType": "double"}],
+                 "measures": []}],
+        relationships=[],
+        translated_measures=[{
+            "name": "FY YTD Sales", "expr": "SUM(source.amount)",
+            "status": "converted",
+            "window": [
+                {"order": "orderdate", "range": "cumulative",
+                 "semiadditive": "last"},
+                {"order": order, "range": "current", "semiadditive": "last"},
+            ],
+        }],
+        known_columns={"factsales": {"orderdate", "amount"}},
+    )
+
+
+def test_fiscal_reset_synthesizes_shifted_year_dimension():
+    spec = _build_fiscal_ytd_spec()
+    dims = {d.name: d.expr for d in spec.dimensions}
+    # FY starting in July: shift back 6 months, truncate, shift forward again —
+    # so a date in FY25 resolves to 2024-07-01, not 2024-01-01.
+    assert dims["orderdate__fy7_year"] == (
+        "add_months(date_trunc('YEAR', add_months(source.orderdate, -6)), 6)")
+
+
+def test_fiscal_reset_window_survives_generation():
+    spec = _build_fiscal_ytd_spec()
+    m = next(m for m in spec.measures if m.name == "FY YTD Sales")
+    assert [w["order"] for w in m.window] == ["orderdate", "orderdate__fy7_year"]
+    yaml_str = _gen().generate_yaml(spec)
+    assert MetricViewValidator().validate_yaml(yaml_str).valid
+
+
+def test_fiscal_reset_with_january_start_is_plain_year_trunc():
+    # A "31-12" anchor is the calendar year; no shift should be emitted.
+    spec = _build_fiscal_ytd_spec(order="orderdate__fy1_year")
+    dims = {d.name: d.expr for d in spec.dimensions}
+    assert dims["orderdate__fy1_year"] == "date_trunc('YEAR', source.orderdate)"
+
+
 def test_compound_reset_window_survives_generation():
     spec = _build_mtd_spec()
     m = next(m for m in spec.measures if m.name == "MTD Sales")
